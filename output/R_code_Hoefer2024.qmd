@@ -1,0 +1,1940 @@
+---
+title: "R Code for Hoefer et al. 2024 - Sensors vs Surveyors: Comparing passive acoustic monitoring, camera trapping and observer-based monitoring for terrestrial mammals."
+author: "Sebastian Hoefer"
+date: today
+title-block-banner: "#161616"
+title-block-banner-color: "white"
+format:
+  html:
+    embed-resources: true
+    grid: 
+      body-width: 2000px
+      sidebar-width: 200px
+      margin-width: 300px
+    toc: true
+    toc-title: \deftocheading{toc}{}
+    toc-depth: 6
+    toc-location: right
+    toc-expand: 1
+    code-overflow: wrap
+    code-block-bg: "F2F2F2"
+    code-block-border-left: "#4A9D9E"
+    highlight-style: github
+    theme: darkly
+    knitr:
+      opts_chunk: 
+        warning: false
+        R.options:
+          width: 120
+standalone: true
+---
+
+# Load packages
+
+Load packages needed for data manipulation and analyses.
+
+```{r}
+#| message: false
+
+library(tidyverse)    # Data wrangling and visualization
+library(colorspace)   # Color manipulation
+library(cmdstanr)     # Interface to 'CmdStan'
+library(brms)         # Bayesian regression models
+library(rstan)        # Interface to Stan
+library(ggeffects)    # Marginal effects plots
+library(DHARMa)       # Residual diagnostics
+library(emmeans)      # Estimated marginal means
+library(tidybayes)    # Tidy data for Bayesian models
+library(vegan)        # Community ecology analysis
+library(EcolUtils)    # Ecology utilities
+library(patchwork)    # Combine ggplots
+library(HDInterval)   # HPD intervals
+library(report)       # Automated reporting
+library(ggsignif)     # Significance levels in ggplot
+library(ggimage)      # Images in ggplot
+library(cowplot)      # Plot composition in ggplot
+library(paletteer)    # For colour palettes
+library(pilot)        # For colour palettes
+```
+
+# Functions
+
+Custom ggplot theme for visualisation.
+
+```{r}
+my.theme <- function(){
+  theme_classic() +
+    theme(text = element_text(family = "Avenir Next"),
+          axis.title.y = element_text(margin = margin(t = 0,r = 20,b = 0,l = 0)),
+          axis.title.x = element_text(margin = margin(t = 20,r = 0,b = 0,l = 0)), 
+          plot.margin = unit(c(5, 10, 5, 10), units = "mm"),
+          strip.background = element_rect(fill = "#CCCCFF"),
+          strip.text.x = element_text(size = 20),
+          axis.title = element_text(size = 20),
+          axis.text = element_text(size = 18),
+          legend.text = element_text(size = 15),
+          legend.title = element_text(size = 15))
+}
+```
+
+# Load data
+
+## All mammal data
+
+```{r}
+mammal_data <- read.csv("mammal_data.csv")
+```
+
+```{r}
+mammal_data_vocal <- mammal_data %>% 
+  filter(vocal == "yes",
+         !common.name %in% c("Yellow-bellied Sheathtail-bat")) # Removed because mostly out of human audible range
+```
+
+Function to summarise the total number of species per method for each plot across all sites. Adding missing zero values for methods that didn't capture any species at a given plot.
+
+```{r}
+summarise_mammal_data <- function(df) {
+  
+  site_plots <- c("Tarcutta.DryA", "Tarcutta.DryB", "Tarcutta.WetA", "Tarcutta.WetB", 
+                  "Duval.DryA", "Duval.DryB", "Duval.WetA", "Duval.WetB", 
+                  "Mourachan.DryA", "Mourachan.DryB", "Mourachan.WetA", "Mourachan.WetB",
+                  "Wambiana.DryA", "Wambiana.DryB", "Wambiana.WetA", "Wambiana.WetB",
+                  "Undara.DryA", "Undara.DryB", "Undara.WetA", "Undara.WetB",
+                  "Rinyirru.DryA", "Rinyirru.DryB", "Rinyirru.WetA", "Rinyirru.WetB")
+
+  sites <- c("Tarcutta", "Duval", "Mourachan", "Wambiana", "Undara", "Rinyirru")
+  
+  methods <- c("PAM.all", "OBM", "PAM.survey", "camera")
+  
+  df <- df %>%
+    unite(site.plot, c(site, plot), sep = ".", remove = FALSE) %>%
+    select(-plot) %>%
+    group_by(site, site.plot, assessment.method) %>%
+    summarise(richness = length(unique(common.name))) %>% # Needs to be common.name because of Dingo and Dog having the same scientific.name
+    ungroup() %>%
+    select(site, site.plot, assessment.method, richness) %>%
+    full_join(crossing(site.plot = unique(.$site.plot),
+                       assessment.method = unique(.$assessment.method)),
+              by = c("site.plot", "assessment.method")) %>%
+    replace_na(list(richness = 0)) %>%
+    mutate(site.plot = factor(site.plot, levels = site_plots),
+           site = str_extract(site.plot, "^[^.]*"),
+           site = factor(site, levels = sites),
+           assessment.method = factor(assessment.method, levels = methods),
+           richness = as.numeric(richness))
+
+  return(df)
+}
+```
+
+Run function.
+
+```{r}
+#| message: false
+
+mammal_data_summary <- summarise_mammal_data(mammal_data)
+mammal_data_vocal_summary <- summarise_mammal_data(mammal_data_vocal)
+```
+
+## PAM data
+
+```{r}
+pam_data <- read_csv("mammals_PAM_daily_all.csv", show_col_types = FALSE) %>% 
+  filter(MANUAL.ID != "UNSURE") %>% 
+  mutate(MANUAL.ID = ifelse(MANUAL.ID == TRUE, 1, 0)) %>% 
+  group_by(template) %>%
+  filter(any(MANUAL.ID == 1)) %>% #Filter for templates with at least one true positive
+  ungroup()
+```
+
+# BirdNET Embeddings Performance Check
+
+## Custom function
+
+Creating a smaller data frame specifically for plotting a smooth line (100 points per template) in plots.
+
+```{r}
+# Function to return predictions over extended range
+run_model <- function(df) {
+  model_logistic <- glm(MANUAL.ID ~ eucledian.distance, 
+                       family = binomial(link = "logit"), 
+                       data = df)
+  
+  # Create extended x range
+  new_x <- data.frame(
+    eucledian.distance = seq(min(df$eucledian.distance), 
+                           max(df$eucledian.distance), 
+                           length.out = 100)
+  )
+  
+  # Get predictions and SE
+  preds <- predict(model_logistic, newdata = new_x, type = "link", se.fit = TRUE)
+  
+  # Add predictions to new_x
+  new_x$fit <- plogis(preds$fit)
+  new_x$lower <- plogis(preds$fit - 1.96 * preds$se.fit)
+  new_x$upper <- plogis(preds$fit + 1.96 * preds$se.fit)
+  
+  # Add template column to predictions
+  new_x$template <- unique(df$template)
+  
+  return(new_x)  # Return only the predictions dataframe
+}
+
+
+# Get the predictions
+model_predictions <- pam_data %>%
+  group_by(template) %>%
+  group_modify(~run_model(.x)) %>%
+  ungroup()
+
+```
+
+## Recall calculations Embeddings
+
+Sample from actual values (does not assume normality).
+
+```{r}
+sample.vec <- function(x, size = 1) {
+  x[sample.int(length(x), size = size, replace = TRUE)]
+}
+
+# Function that uses a simple for-loop to compare random draws from positives vs negatives
+calculate_probability_loop <- function(distancesPositives, distancesNegatives, nComparisons = 10000) {
+  
+  set.seed(123)
+  # Set up a vector to record comparisons
+  comparisons <- c()
+  for (i in seq_len(nComparisons)) {
+    # Draw one random value from positives and one from negatives
+    comparisons <- c(
+      comparisons,
+      sample.vec(distancesPositives, 1) < sample.vec(distancesNegatives, 1)
+    )
+  }
+  # Return the fraction of times pos < neg
+  sum(comparisons) / length(comparisons)
+}
+
+# Now apply this by template
+template_probabilities <- pam_data %>%
+  group_by(template) %>%
+  summarise(
+    probability = calculate_probability_loop(
+      eucledian.distance[MANUAL.ID == 1],
+      eucledian.distance[MANUAL.ID == 0],
+      10000
+    )
+  )
+```
+
+## Visualisation
+
+```{r}
+#| fig-width: 27
+#| fig-asp: 0.6
+#| warning: false
+
+(combined_plot <- ggplot(pam_data, aes(x = eucledian.distance, y = MANUAL.ID)) +  
+  # Add CI ribbon
+  geom_ribbon(data = model_predictions,
+              aes(y = fit, ymin = lower, ymax = upper),
+              fill = "grey70",
+              alpha = 0.3) +
+  # Add CI boundary lines
+  geom_line(data = model_predictions,
+            aes(y = lower),
+            linetype = "dashed",
+            color = "black",
+            linewidth = 0.8) +
+  geom_line(data = model_predictions,
+            aes(y = upper),
+            linetype = "dashed",
+            color = "black",
+            linewidth = 0.8) +
+  # Add mean prediction line
+  geom_line(data = model_predictions,
+            aes(y = fit),
+            color = "black",
+            linewidth = 2) +
+  geom_rug(data = subset(pam_data, MANUAL.ID == 0),
+           aes(x = eucledian.distance),
+           color = "#5093CB", alpha = 0.3,
+           length = unit(0.05, "npc"),
+           linewidth = 0.8, 
+           sides = "b",
+           inherit.aes = FALSE) +
+  geom_rug(data = subset(pam_data, MANUAL.ID == 1),
+           aes(x = eucledian.distance),
+           color = "#F78303", alpha = 0.3,
+           length = unit(0.05, "npc"),
+           linewidth = 0.8, 
+           sides = "t",
+           inherit.aes = FALSE) +
+  geom_text(data = template_probabilities,
+            aes(x = Inf, y = Inf, label = sprintf("%.2f", probability)),
+            hjust = 1.3, vjust = 2, inherit.aes = FALSE) +
+  facet_wrap(~ template, scales = "free_x", ncol = 10) +
+  labs(x = "Euclidean Distance", 
+       y = "Probability of correct prediction") +
+  scale_y_continuous(limits = c(-0.1, 1.1), breaks = seq(0, 1, 0.25)) +
+  theme_bw() +
+  theme(strip.background = element_blank(),
+        strip.text = element_text(face = "bold"),
+        axis.title = element_text(size = 23, face = "bold"),
+        axis.title.x = element_text(margin = margin(t = 25, r = 0, b = 0, l = 0)),
+        axis.title.y = element_text(margin = margin(t = 0, r = 25, b = 0, l = 0)),
+        plot.margin = unit(c(5, 10, 5, 10), units = "mm")))
+```
+
+# Mammal Traits Effect
+
+Imported from COMBINE (https://doi.org/10.1002/ecy.3344) and added five species not in the database using Field Companion to the Mammals of Australia and HomeRangeData (https://doi.org/10.1111/geb.13625). HomeRangeData was also used to fill in missing home range information. Detectability was calculated by divided true positive detections by overall detections and added.
+
+```{r}
+trait_detect <- read_csv("trait_detect.csv") %>% 
+  mutate(fossoriality = as.factor(fossoriality),
+         activity_cycle = as.factor(activity_cycle),
+         terrestrial_volant = as.factor(terrestrial_volant))
+```
+
+```{r}
+custom_labels <- function(x) {
+  ifelse(x >= 1, 
+         scales::comma(x, accuracy = 1),                    # Whole numbers for ≥ 1
+         ifelse(x >= 0.1,
+                scales::comma(x, accuracy = 0.1),           # 1 decimal for 0.1 to < 1  
+                scales::comma(x, accuracy = 0.01)))         # 2 decimals for < 0.1
+}
+
+p1 <- trait_detect %>%
+ggplot(aes(adult_mass_g/1000, detectability)) +
+  geom_smooth(method = "lm", col = "#F78303", linewidth = 1.5) +
+  geom_point(size = 2.5, alpha = 0.8) +
+  my.theme() +
+  scale_y_continuous(name = "Detection probability",
+                     breaks = seq(0, 0.10, by = 0.05)) +
+  coord_cartesian(ylim = c(-0.02, 0.12)) +
+  scale_x_log10(name = "Adult mass (kg)", 
+                labels = custom_labels,
+                expand = expansion(mult = c(-0.14, 0.05)))
+```
+
+```{r}
+p2 <- ggplot(trait_detect, aes(dispersal_km, detectability)) +
+  geom_smooth(method = "lm", col = "#F78303", linewidth = 1.5) +
+  geom_point(size = 2.5, alpha = 0.8) +
+  my.theme() +
+  scale_y_continuous(name = "Detection probability",
+                     breaks = seq(0, 0.10, by = 0.05)) +
+  coord_cartesian(ylim = c(-0.02, 0.12)) +
+  scale_x_continuous(name = "Dispersal (km)",
+                     breaks = seq(0,16,by=2),
+                     expand = expansion(mult = c(0.02, 0.05)))
+```
+
+```{r}
+p3 <- trait_detect %>% 
+ggplot(aes(home_range_km2, detectability)) +
+  geom_smooth(method = "lm", col = "#F78303", linewidth = 1.5) +
+  geom_point(size = 2.5, alpha = 0.8) +
+  my.theme() +
+  scale_y_continuous(name = "Detection probability",
+                     breaks = seq(0, 0.10, by = 0.05)) +
+  coord_cartesian(ylim = c(-0.02, 0.12)) +
+  scale_x_log10(name = "Home range (km)", 
+                labels = custom_labels,
+                expand = expansion(mult = c(-0.12, 0.05)))
+```
+
+```{r}
+pal <- c("#204366","#CB8D79")
+pal_dark <- after_scale(darken(pal, .1, space = "HLS"))
+
+p4 <- trait_detect %>% 
+  drop_na(fossoriality) %>% 
+ggplot(aes(fossoriality, detectability, fill = fossoriality)) +
+  geom_boxplot(aes(color = fossoriality,
+                   fill = after_scale(desaturate(lighten(color, .8), .4))),
+               position = position_dodge2(width = 0.4),
+               width = .6, outlier.shape = NA) +
+  geom_point(aes(fill = fossoriality), color = "transparent",
+             position = position_dodge2(width = 0.4),
+             shape = 21, stroke = .4, size = 3.5, alpha = .4) +
+  my.theme() +
+  scale_fill_manual(values = pal, guide = "none") +
+  scale_colour_manual(values = pal_dark,guide = "none") +
+  scale_y_continuous(name = "Detection probability",
+                     breaks = seq(0, 0.10, by = 0.05)) +
+  scale_x_discrete(name = "Fossoriality",
+                   labels = c("Fossorial", "Above ground dwelling"))
+```
+
+```{r}
+pal2 <- c("#204366","#CB8D79", "#324742")
+pal2_dark <- after_scale(darken(pal2, .1, space = "HLS"))
+
+p5 <- trait_detect %>% 
+  drop_na(activity_cycle) %>% 
+ggplot(aes(activity_cycle, detectability, fill = activity_cycle)) +
+  geom_boxplot(aes(color = activity_cycle,
+                   fill = after_scale(desaturate(lighten(color, .8), .4))),
+               position = position_dodge2(width = 0.4),
+               width = .6, outlier.shape = NA) +
+  geom_point(aes(fill = activity_cycle), color = "transparent",
+             position = position_dodge2(width = 0.4),
+             shape = 21, stroke = .4, size = 3.5, alpha = .4) +
+  my.theme() +
+  scale_fill_manual(values = pal2, guide = "none") +
+  scale_colour_manual(values = pal2_dark,guide = "none") +
+  scale_y_continuous(name = "Detection probability",
+                     breaks = seq(0, 0.10, by = 0.05)) +
+  scale_x_discrete(name = "Activity cycle",
+                   labels = c("Nocturnal", "Cathemeral", "Diurnal"))
+```
+
+```{r}
+pal3 <- c("#204366","#CB8D79")
+pal3_dark <- after_scale(darken(pal3, .1, space = "HLS"))
+
+p6 <- trait_detect %>% 
+  drop_na(terrestrial_volant) %>% 
+ggplot(aes(terrestrial_volant, detectability, fill = terrestrial_volant)) +
+  geom_boxplot(aes(color = terrestrial_volant,
+                   fill = after_scale(desaturate(lighten(color, .8), .4))),
+               position = position_dodge2(width = 0.4),
+               width = .6, outlier.shape = NA) +
+  geom_point(aes(fill = terrestrial_volant), color = "transparent",
+             position = position_dodge2(width = 0.4),
+             shape = 21, stroke = .4, size = 3.5, alpha = .4) +
+  my.theme() +
+  scale_fill_manual(values = pal3, guide = "none") +
+  scale_colour_manual(values = pal3_dark,guide = "none") +
+  scale_y_continuous(name = "Detection probability",
+                     breaks = seq(0, 0.10, by = 0.05)) +
+  scale_x_discrete(name = "Volant",
+                   labels = c("Non-flying", "Flying"))
+```
+
+```{r}
+#| fig-width: 22
+#| fig-asp: 0.6
+#| warning: false
+#| message: false
+
+(traits_plot <- p1 + p2 + p3 + p4 + p5 + p6 +
+    plot_annotation(tag_levels = "A") &
+  theme(plot.tag = element_text(size = 20, face = "bold")))
+```
+
+## Investigation
+
+```{r}
+trait_detect_clean <- trait_detect %>% 
+  drop_na(detectability)
+
+model1 <- glm(detectability ~ adult_mass_g, data = trait_detect_clean)
+summary(model1)
+
+model2 <- glm(detectability ~ dispersal_km, data = trait_detect_clean)
+summary(model2)
+
+model3 <- glm(detectability ~ fossoriality, data = trait_detect_clean)
+summary(model3)
+
+model4 <- glm(detectability ~ home_range_km2, data = trait_detect_clean)
+summary(model4)
+
+model5 <- glm(detectability ~ activity_cycle, data = trait_detect_clean)
+summary(model5)
+
+aov1 <- aov(detectability ~ activity_cycle, data = trait_detect_clean)
+summary(aov1)
+
+model6 <- glm(detectability ~ terrestrial_volant, data = trait_detect_clean)
+summary(model6)
+```
+
+# Species Richness
+
+Given the inherent inability of passive acoustic monitoring to detect non-vocalising species, the mammal community was considered in two ways: i) entire mammal community (All Mammals), and ii) vocal mammals only (Vocal Mammals).
+
+## All Mammals
+
+Considering the entire mammal community with vocal and non-vocal species.
+
+### Bayesian Analysis
+
+#### Priors
+
+Defining priors for Bayesian models.
+
+::: {.panel-tabset .nav-pills}
+
+##### Priors for the intercept
+
+```{r}
+mammal_data_summary %>% summarise(median(log(richness)))
+mammal_data_summary %>% summarise(mad(log(richness)))
+```
+
+Priors for the intercept are 1.8 and 1.
+
+##### Priors for the slope
+
+```{r}
+log(sd(mammal_data_summary$richness))/apply(model.matrix(~assessment.method, data = mammal_data_summary), 2, sd)
+```
+
+Priors for the slope are 2.8.
+:::
+
+#### Fit model
+
+::: {.panel-tabset .nav-pills}
+
+##### Model 1
+
+```{r}
+priors1 <- prior(normal(1.8,1), class  = "Intercept") +
+  prior(normal(0,2.8), class = "b") +
+  prior(student_t(3,0,2.8), class = "sd")
+
+methods.form1 <- bf(richness ~ assessment.method + (1|site/site.plot),
+                 family = poisson(link = "log"))
+
+methods.brm1 <- brm(methods.form1,
+                  data = mammal_data_summary,
+                  prior = priors1,
+                  sample_prior = "only",
+                  refresh = 0,
+                  chains = 3, cores = 3,
+                  iter = 5000,
+                  thin = 5,
+                  seed = 3,
+                  warmup = 1000,
+                  backend = 'cmdstanr',
+                  save_pars = save_pars(all = TRUE))
+```
+
+###### Prior vs Posterior
+
+```{r}
+methods.brm1b <- methods.brm1 %>%
+  update(sample_prior = "yes",
+         refresh = 0,
+         seed = 3,
+         cores = 3,
+         backend = "cmdstanr",
+         save_pars = save_pars(all = TRUE))
+```
+
+##### Model 2
+
+```{r}
+priors2 <- prior(normal(1.8,1), class  = "Intercept") +
+  prior(normal(0,2.8), class = "b") +
+  prior(student_t(3,0,2.8), class = "sd")
+
+methods.form2 <- bf(richness ~ assessment.method + (1|site/site.plot),
+                 family="negbinomial")
+
+methods.brm2 <- brm(methods.form2,
+                  data = mammal_data_summary,
+                  prior = priors2,
+                  sample_prior = "only",
+                  refresh = 0,
+                  chains = 3, cores = 3,
+                  iter = 5000,
+                  thin = 5,
+                  seed = 8,
+                  warmup = 1000,
+                  backend = 'cmdstanr',
+                  save_pars = save_pars(all = TRUE))
+```
+
+###### Prior vs Posterior
+
+```{r}
+methods.brm2b <- methods.brm2 %>%
+  update(sample_prior = "yes",
+         refresh = 0,
+         seed = 8,
+         cores = 3,
+         backend = "cmdstanr",
+         save_pars = save_pars(all = TRUE))
+```
+
+##### Model 3
+
+```{r}
+priors3 <- prior(normal(1.8,1), class  = "Intercept") +
+  prior(normal(0,2.8), class = "b") +
+  prior(student_t(3,0,2.8), class = "sd")
+
+methods.form3 <- bf(richness ~ assessment.method + (1|site/site.plot),
+                 family="negbinomial2")
+
+methods.brm3 <- brm(methods.form3,
+                  data = mammal_data_summary,
+                  prior = priors3,
+                  sample_prior = "only",
+                  refresh = 0,
+                  chains = 3, cores = 3,
+                  iter = 5000,
+                  thin = 5,
+                  seed = 1,
+                  warmup = 1000,
+                  control = list(adapt_delta=0.99),
+                  backend = 'cmdstanr',
+                  save_pars = save_pars(all = TRUE))
+```
+
+###### Prior vs Posterior
+
+```{r}
+methods.brm3b <- methods.brm3 %>%
+  update(sample_prior = "yes",
+         refresh = 0,
+         seed = 2,
+         cores = 3,
+         control = list(adapt_delta=0.99),
+         backend = "cmdstanr",
+         save_pars = save_pars(all = TRUE))
+```
+
+:::
+
+#### Compare Models
+
+::: {.panel-tabset .nav-pills}
+
+###### Loo Model 1
+
+```{r}
+(l.1b <- methods.brm1b %>% loo())
+```
+
+###### Loo Model 2
+```{r}
+(l.2b <- methods.brm2b %>% loo())
+```
+
+###### Loo Model 3
+```{r}
+(l.3b <- methods.brm3b %>% loo())
+```
+
+###### Loo Comparison
+```{r}
+loo_compare(loo(methods.brm1b), loo(methods.brm2b), loo(methods.brm3b))
+```
+
+Model `methods.brm1b` was selected as best model based on loo estimates.
+
+:::
+
+#### Diagnostics
+
+::: {.panel-tabset .nav-pills}
+
+###### Trace plots
+
+```{r}
+methods.brm1b$fit %>% stan_trace()
+```
+
+###### Autocorrelation plots
+
+```{r}
+methods.brm1b$fit %>% stan_ac()
+```
+
+###### Rhat statistic
+
+```{r}
+methods.brm1b$fit %>% stan_rhat()
+```
+
+###### Effective sampling size
+
+```{r}
+methods.brm1b$fit %>% stan_ess()
+```
+
+###### Posterior predictive check plot
+
+```{r}
+methods.brm1b %>% pp_check(type = "dens_overlay", ndraws = 200)
+```
+
+###### DHARMa residuals
+
+```{r}
+set.seed(6)
+preds <- posterior_predict(methods.brm1b,  ndraws=250,  summary=FALSE)
+method.resids <- createDHARMa(simulatedResponse = t(preds),
+                            observedResponse = mammal_data_summary$richness,
+                            fittedPredictedResponse = apply(preds, 2, median),
+                            integerResponse = TRUE)
+method.resids %>% plot()
+```
+
+###### Dispersion test
+
+```{r}
+method.resids %>% testDispersion()
+```
+
+###### Zero-inflation test
+
+```{r}
+method.resids %>% testZeroInflation()
+```
+
+:::
+
+#### Investigation
+
+##### Methods pairwise comparison across sites
+
+```{r}
+(diff.methods.avg <- methods.brm1b %>%
+  emmeans(~assessment.method) %>%
+  regrid(transform = "none") %>%
+  pairs() %>% 
+  gather_emmeans_draws() %>% 
+  mutate(f.change = exp(.value)) %>% 
+  summarise("Average fractional change" = median(f.change),
+            "Lower HDI" = HDInterval::hdi(f.change)[1],
+            "Upper HDI" = HDInterval::hdi(f.change)[2],
+            "Probability of difference" = sum(.value > 0)/n())) #to see if there is any change
+
+(diff.methods.avg.rev <- methods.brm1b %>%
+  emmeans(~assessment.method) %>%
+  regrid(transform = "none") %>%
+  pairs(reverse = TRUE) %>% 
+  gather_emmeans_draws() %>% 
+  mutate(f.change = exp(.value)) %>% 
+  summarise("Average fractional change" = median(f.change),
+            "Lower HDI" = HDInterval::hdi(f.change)[1],
+            "Upper HDI" = HDInterval::hdi(f.change)[2],
+            "Probability of difference" = sum(.value > 0)/n())) #to see if there is any change
+```
+
+#### Visualisation
+
+```{r}
+#| fig-width: 16
+#| fig-asp: 0.6
+
+pal <- c("#189F9F","#FF8C00", "#18709F", "#A034F0")
+pal_dark <- after_scale(darken(pal, .1, space = "HLS"))
+
+(methods.boxplot <- ggplot(mammal_data_summary, aes(assessment.method, richness)) +
+  geom_boxplot(aes(color = assessment.method,
+                   fill = after_scale(desaturate(lighten(color, .8), .4))),
+               position = position_dodge2(width = 0.6),
+               width = .6, outlier.shape = NA) +
+  geom_point(aes(fill = assessment.method), color = "transparent",
+             position = position_dodge2(width = 0.6),
+             shape = 21, stroke = .4, size = 3.5, alpha = .3) +
+  my.theme() +
+  scale_y_continuous(limits = c(0,20),breaks = seq(0, 20, by = 2),
+                     name = "Total Species Richness") +
+  scale_x_discrete(name = "", labels = c("", "", "", "")) +
+  scale_fill_manual(values = pal, guide = "none") +
+  scale_colour_manual(values = pal_dark, name = "", labels = c("PAM (all audio)","OBM", "PAM (survey period)","Camera Trap")) +
+  theme(legend.text = element_text(size = 14, margin = margin(t = 5)),
+        legend.position = c(y=0.45, x=-0.15),
+        legend.background = element_rect(fill = "transparent"),
+        plot.margin = unit(c(5, 10, 20, 10), units = "mm")) +
+  guides(colour = guide_legend(nrow = 1)) +
+    geom_signif(comparisons = list(c("PAM.all", "PAM.survey"),
+                                   c("OBM", "PAM.survey"),
+                                   c("OBM", "camera"),
+                                   c("PAM.survey", "camera")),
+                annotations = c("2.13, HDI 95%[1.62,2.72]",
+                                "2.46, HDI 95%[1.85,3.12]",
+                                "1.44, HDI 95%[1.16,1.77]",
+                                "0.59, HDI 95%[0.43,0.74]"),
+                y_position = c(16, 17.5, 19, 12)))
+```
+
+## Vocal Mammals
+
+Considering vocal mammals only and excluding non-vocal mammals from the analysis.
+
+### Bayesian Analysis
+
+#### Priors
+
+Defining priors for Bayesian models.
+
+::: {.panel-tabset .nav-pills}
+
+##### Priors for the intercept
+
+```{r}
+mammal_data_vocal_summary %>% summarise(median(log(richness)))
+mammal_data_vocal_summary %>% summarise(mad(log(richness)))
+```
+
+Priors for the intercept are 1.6 and 1.
+
+##### Priors for the slope
+
+```{r}
+log(sd(mammal_data_vocal_summary$richness))/apply(model.matrix(~assessment.method, data = mammal_data_vocal_summary), 2, sd)
+```
+
+Priors for the slope are 2.5.
+
+:::
+
+#### Fit model
+
+::: {.panel-tabset .nav-pills}
+
+##### Model 1
+
+```{r}
+priors_vocal1 <- prior(normal(1.6,1), class  = "Intercept") +
+  prior(normal(0,2.5), class = "b") +
+  prior(student_t(3,0,2.5), class = "sd")
+
+methods.vocal.form1 <- bf(richness ~ assessment.method + (1|site/site.plot),
+                 family = poisson(link = "log"))
+
+methods.vocal.brm1 <- brm(methods.vocal.form1,
+                  data = mammal_data_vocal_summary,
+                  prior = priors_vocal1,
+                  sample_prior = "only",
+                  refresh = 0,
+                  chains = 3, cores = 3,
+                  iter = 5000,
+                  thin = 5,
+                  seed = 3,
+                  warmup = 1000,
+                  backend = 'cmdstanr',
+                  save_pars = save_pars(all = TRUE))
+```
+
+###### Prior vs Posterior
+
+```{r}
+methods.vocal.brm1b <- methods.vocal.brm1 %>%
+  update(sample_prior = "yes",
+         refresh = 0,
+         seed = 3,
+         cores = 3,
+         backend = "cmdstanr",
+         save_pars = save_pars(all = TRUE))
+```
+
+##### Model 2
+
+```{r}
+priors_vocal2 <- prior(normal(1.6,1), class  = "Intercept") +
+  prior(normal(0,2.5), class = "b") +
+  prior(student_t(3,0,2.5), class = "sd")
+
+methods.vocal.form2 <- bf(richness ~ assessment.method + (1|site/site.plot),
+                 family="negbinomial")
+
+methods.vocal.brm2 <- brm(methods.vocal.form2,
+                  data = mammal_data_vocal_summary,
+                  prior = priors_vocal2,
+                  sample_prior = "only",
+                  refresh = 0,
+                  chains = 3, cores = 3,
+                  iter = 5000,
+                  thin = 5,
+                  seed = 2,
+                  warmup = 1000,
+                  backend = 'cmdstanr',
+                  save_pars = save_pars(all = TRUE))
+```
+
+###### Prior vs Posterior
+
+```{r}
+methods.vocal.brm2b <- methods.vocal.brm2 %>%
+  update(sample_prior = "yes",
+         refresh = 0,
+         seed = 2,
+         cores = 3,
+         backend = "cmdstanr",
+         save_pars = save_pars(all = TRUE))
+```
+
+##### Model 3
+
+```{r}
+priors_vocal3 <- prior(normal(1.6,1), class  = "Intercept") +
+  prior(normal(0,2.5), class = "b") +
+  prior(student_t(3,0,2.5), class = "sd")
+
+methods.vocal.form3 <- bf(richness ~ assessment.method + (1|site/site.plot),
+                 family="negbinomial2")
+
+methods.vocal.brm3 <- brm(methods.vocal.form3,
+                  data = mammal_data_vocal_summary,
+                  prior = priors_vocal3,
+                  sample_prior = "only",
+                  refresh = 0,
+                  chains = 3, cores = 3,
+                  iter = 5000,
+                  thin = 5,
+                  seed = 3,
+                  warmup = 1000,
+                  control = list(adapt_delta=0.99),
+                  backend = 'cmdstanr',
+                  save_pars = save_pars(all = TRUE))
+```
+
+###### Prior vs Posterior
+
+```{r}
+methods.vocal.brm3b <- methods.vocal.brm3 %>%
+  update(sample_prior = "yes",
+         refresh = 0,
+         seed = 3,
+         cores = 3,
+         control = list(adapt_delta=0.99),
+         backend = "cmdstanr",
+         save_pars = save_pars(all = TRUE))
+```
+
+:::
+
+##### Compare Models
+
+::: {.panel-tabset .nav-pills}
+
+###### Loo Model 1
+
+```{r}
+(l.1b <- methods.vocal.brm1b %>% loo())
+```
+
+###### Loo Model 2
+
+```{r}
+(l.2b <- methods.vocal.brm2b %>% loo())
+```
+
+###### Loo Model 3
+
+```{r}
+(l.3b <- methods.vocal.brm3b %>% loo())
+```
+
+###### Loo Comparison
+
+```{r}
+loo_compare(loo(methods.vocal.brm1b), loo(methods.vocal.brm2b), loo(methods.vocal.brm3b))
+```
+Model `methods.vocal.brm1b` was selected as best model based on loo estimates.
+
+:::
+
+##### Diagnostics
+
+::: {.panel-tabset .nav-pills}
+
+###### Trace plots
+
+```{r}
+methods.vocal.brm1b$fit %>% stan_trace()
+```
+
+###### Autocorrelation plots
+
+```{r}
+methods.vocal.brm1b$fit %>% stan_ac()
+```
+
+###### Rhat statistic
+
+```{r}
+methods.vocal.brm1b$fit %>% stan_rhat()
+```
+
+###### Effective sampling size
+
+```{r}
+methods.vocal.brm1b$fit %>% stan_ess()
+```
+
+###### Posterior predictive check plot
+
+```{r}
+methods.vocal.brm1b %>% pp_check(type = "dens_overlay", ndraws = 200)
+```
+
+###### DHARMa residuals
+
+```{r}
+set.seed(6)
+preds.vocal <- posterior_predict(methods.vocal.brm1b,  ndraws=250,  summary=FALSE)
+method.resids <- createDHARMa(simulatedResponse = t(preds.vocal),
+                            observedResponse = mammal_data_vocal_summary$richness,
+                            fittedPredictedResponse = apply(preds.vocal, 2, median),
+                            integerResponse = TRUE)
+method.resids %>% plot()
+```
+
+###### Dispersion test
+
+```{r}
+method.resids %>% testDispersion()
+```
+
+###### Zero-inflation test
+
+```{r}
+method.resids %>% testZeroInflation()
+```
+:::
+
+#### Investigation
+
+##### Methods pairwise comparison across sites
+
+```{r}
+(diff.methods.vocal.avg <- methods.vocal.brm1b %>%
+  emmeans(~assessment.method) %>%
+  regrid(transform = "none") %>%
+  pairs() %>% 
+  gather_emmeans_draws() %>% 
+  mutate(f.change = exp(.value)) %>% 
+  summarise("Average fractional change" = median(f.change),
+            "Lower HDI" = HDInterval::hdi(f.change)[1],
+            "Upper HDI" = HDInterval::hdi(f.change)[2],
+            "Probability of difference" = sum(.value > 0)/n())) #to see if there is any change
+
+(diff.methods.vocal.avg.rev <- methods.vocal.brm1b %>%
+  emmeans(~assessment.method) %>%
+  regrid(transform = "none") %>%
+  pairs(reverse = TRUE) %>% 
+  gather_emmeans_draws() %>% 
+  mutate(f.change = exp(.value)) %>% 
+  summarise("Average fractional change" = median(f.change),
+            "Lower HDI" = HDInterval::hdi(f.change)[1],
+            "Upper HDI" = HDInterval::hdi(f.change)[2],
+            "Probability of difference" = sum(.value > 0)/n())) #to see if there is any change
+```
+
+#### Visualisation
+
+```{r}
+#| fig-width: 16
+#| fig-asp: 0.6
+
+pal <- c("#189F9F","#FF8C00", "#18709F","#A034F0")
+pal_dark <- after_scale(darken(pal, .1, space = "HLS"))
+
+(methods.boxplot.vocal <- ggplot(mammal_data_vocal_summary, aes(assessment.method, richness)) +
+  geom_boxplot(aes(color = assessment.method,
+                   fill = after_scale(desaturate(lighten(color, .8), .4))),
+               position = position_dodge2(width = 0.6),
+               width = .6, outlier.shape = NA) +
+  geom_point(aes(fill = assessment.method), color = "transparent",
+             position = position_dodge2(width = 0.6),
+             shape = 21, stroke = .4, size = 3.5, alpha = .3) +
+  my.theme() +
+  scale_y_continuous(limits = c(0,20),breaks = seq(0, 20, by = 2),
+                     name = "") +
+  scale_x_discrete(name = "", labels = c("", "", "", "")) +
+  scale_fill_manual(values = pal, guide = "none") +
+  scale_colour_manual(values = pal_dark, name = "", labels = c("PAM (all audio)","OBM", "PAM (survey period)","Camera Trap")) +
+  theme(legend.text = element_text(size = 14, margin = margin(t = 5)),
+        legend.position = c(y=0.45, x=-0.15),
+        legend.background = element_rect(fill = "transparent"),
+        plot.margin = unit(c(5, 10, 20, 10), units = "mm")) +
+  guides(colour = guide_legend(nrow = 1)) +
+  geom_signif(comparisons = list(c("PAM.all", "OBM"),
+                                 c("PAM.all", "PAM.survey"),
+                                 c("PAM.all", "camera"),
+                                 c("OBM", "camera")),
+                annotations = c("1.58, HDI 95%[1.24,1.98]",
+                                "2.12, HDI 95%[1.61,2.69]",
+                                "2.29, HDI 95%[1.73,2.93]",
+                                "1.46, HDI 95%[1.05,1.87]"),
+                y_position = c(12.5, 14, 15.5, 9)))
+
+```
+
+##### Combined Figure
+
+```{r}
+#| fig-width: 16
+#| fig-asp: 0.6
+
+(methods.vocal.combined <- (methods.boxplot + ggtitle('All mammals') & theme(legend.position = "none", plot.title = element_text(size = 24))) +
+   (methods.boxplot.vocal + ggtitle('Vocal mammals') & theme(legend.position = "none", plot.title = element_text(size = 24))) +
+   theme(legend.position = c(-0.25,-0.2), legend.text = element_text(size = 22),
+         plot.margin = unit(c(5, 10, 30, 10), units = "mm")))
+```
+
+## Correlation PAM vocal mammals & OBM mammals
+
+Investigate a correlation between species richness of vocal mammals detected by PAM and species richness of the entire mammal community detected by OBM.
+
+```{r}
+#| fig-width: 10
+#| fig-asp: 0.6
+
+cor_mammal_data <- mammal_data_summary |> 
+  filter(assessment.method %in% c("OBM", "PAM.all")) |> 
+  group_by(site.plot) |> 
+  pivot_wider(names_from = "assessment.method", #transformed dataset from long to wide format
+              values_from = "richness",
+              values_fill = list(number=0))
+
+(corr_plot <- ggplot(cor_mammal_data, aes(PAM.all,OBM)) +
+  geom_point(aes(col = site), size = 3) +
+  geom_smooth(method = "lm") +
+  my.theme() +
+  theme(legend.position = "bottom") +
+  scale_y_continuous(name = "Species Richness OBM", breaks = seq(4, 16, by = 4)) +
+  scale_x_continuous(name = "Species Richness PAM", breaks = seq(2, 13, by = 2)) +
+  scale_color_manual(name = "", values = c("seagreen", "steelblue","salmon2", "darkorchid1", "aquamarine3", "goldenrod1")) +
+  guides(color = guide_legend(nrow = 1)) +
+  annotate("text", x = 5, y = 15,
+           label = "R^2 == 0.21", parse = TRUE, size = 5))
+```
+
+```{r}
+# Perform Pearson's correlation test
+correlation_test <- cor.test(cor_mammal_data$PAM.all, cor_mammal_data$OBM, method = "pearson")
+
+print(correlation_test)
+
+(R.squared <- 0.4575097^2)
+
+```
+
+# Community Composition
+
+## All Mammals
+
+Considering the entire mammal community with vocal and non-vocal species.
+
+### Prepare data
+
+```{r}
+mammal_community3 <- mammal_data %>% 
+  filter(!recapture %in% c("y")) %>%  # Removed recaptures
+  select(site, assessment.method,common.name) %>% # Selected relevant grouping variables
+  group_by(across(everything())) %>% # Grouped by all available columns
+  mutate(number = n()) %>% # Created a numbers column that counts the number of duplicate observations
+  ungroup() %>% 
+  unique() %>% # Merged the duplicate rows
+  pivot_wider(names_from = "common.name", # Transformed dataset from long to wide format
+              values_from = "number",
+              values_fill = list(number=0)) %>% # Replaced NAs with 0
+  arrange(site) %>% # Ordered by site
+  mutate(assessment.method = factor(assessment.method)) # Turned asssessment methods into factors
+```
+
+In preparation for community analyses, only keep columns and rows with values above 0.
+
+```{r}
+all <- mammal_community3 %>% select(where(~ any(. != 0))) %>% filter(rowSums(.[,3:ncol(.)]) > 0)
+```
+
+Transformation of the data to binary (presence/absence) for Jaccard dissimilarity.
+
+```{r}
+all_jacc <- all %>%
+  select(where(is.numeric)) %>% # Removed columns with non-numerical values
+  decostand(method="pa", MARGIN = 1) %>% # Standardised presence/absence (method = "pa") by rows (MARGIN = 1)
+  cbind(all[,1:2]) %>% 
+  select(site, assessment.method, everything())
+```
+
+## NMDS Ordination
+
+### Jaccard dissimilarity
+
+```{r}
+set.seed(11)
+all_nmds_jacc <-  metaMDS(all_jacc[4:ncol(all_jacc)], distance="jaccard", k=3,trymax=100, autotransform = FALSE)
+```
+
+## Visualisation
+
+### Jaccard dissimilarity
+
+Function to create nMDS plots with centroids.
+
+```{r}
+#| fig-width: 14
+#| fig-asp: 0.6
+
+create_plot <- function(data, nmds_data) {
+  methods <- nmds_data$points
+  species <- as.data.frame(nmds_data$species) %>% mutate(species = row.names(.))
+  df <- cbind.data.frame(data[,1:2], methods)
+  gg <- merge(df, aggregate(cbind(mean.x=MDS1,mean.y=MDS2)~assessment.method, df, mean), by="assessment.method") %>%
+    mutate(assessment.method = factor(assessment.method, levels = c("PAM.all", "OBM","PAM.survey", "camera")))
+  ggplot(gg, aes(MDS1,MDS2,color=assessment.method)) +
+    geom_point(size=3) + # Smaller outside points
+    geom_point(aes(x=mean.x,y=mean.y),size=5) + # This controls the centroids
+    scale_colour_manual(values = c("#189F9F","#FF8C00", "#18709F","#A034F0"),
+                        name = "",
+                        labels = c("PAM (all audio)", "OBM", "PAM (survey period)","Camera Trap")) +
+    geom_segment(aes(x=mean.x, y=mean.y, xend=MDS1, yend=MDS2), alpha = 0.2, linewidth = 1.5) + # This controls the connections between points and centroids
+    my.theme() +
+    theme(legend.position = "bottom")
+}
+
+(nmds.all.plot.jacc.centroid <- create_plot(all_jacc, all_nmds_jacc))
+```
+
+### Investigation
+
+#### Adonis
+
+##### Jaccard dissimilarity
+
+```{r}
+#| warning: false
+
+all.dist2 <- vegdist(all_jacc[3:ncol(all_jacc)], 'jaccard')
+(all.adonis <- adonis2(all.dist2 ~ assessment.method, data=all_jacc))
+#Permutation test: significant difference between assessment methods for mammal communities.
+
+#Let's which method is different from which
+(adonis.methods.jacc <- adonis.pair(all.dist2, all_jacc$assessment.method, corr.method = "holm"))
+#comparing all methods with each other
+
+```
+
+## Vocal Mammals
+
+Considering vocal mammals only and excluding non-vocal mammals from the analysis.
+
+### Prepare data
+
+```{r}
+mammal_community4 <- mammal_data_vocal %>% 
+  filter(!recapture %in% c("y")) %>%  
+  select(site, assessment.method,common.name) %>% #selected relevant grouping variables
+  group_by(across(everything())) %>% #groups by all available columns
+  mutate(number = n()) %>% #created a numbers column that counts the number of duplicate observations
+  ungroup() %>% 
+  unique() %>% #merged the duplicate rows
+  pivot_wider(names_from = "common.name", #transformed dataset from long to wide format
+              values_from = "number",
+              values_fill = list(number=0)) %>% #replaced NAs with 0
+  arrange(site) %>% 
+  mutate(assessment.method = factor(assessment.method))
+```
+
+```{r}
+all_vocal <- mammal_community4 %>% select(where(~ any(. != 0))) %>% filter(rowSums(.[,3:ncol(.)]) > 0)
+```
+
+```{r}
+#Function decostand() standardises presence/absence (method = "pa") by rows (MARGIN = 1)
+all_vocal_jacc <- all_vocal %>%
+  select(where(is.numeric)) %>%
+  decostand(method="pa", MARGIN = 1) %>% 
+  cbind(all_vocal[,1:2]) %>% 
+  select(site, assessment.method, everything())
+```
+
+
+### NMDS Ordination
+
+#### Jaccard dissimilarity
+```{r, results='hide'}
+set.seed(11)
+all_nmds_jacc_vocal <-  metaMDS(all_vocal_jacc[4:ncol(all_vocal_jacc)], distance="jaccard", k=3,trymax=100, autotransform = FALSE)
+```
+
+### Visualisation
+
+#### Jaccard dissimilarity
+
+```{r}
+#| fig-width: 14
+#| fig-asp: 0.6
+
+create_plot <- function(data, nmds_data) {
+  methods <- nmds_data$points
+  species <- as.data.frame(nmds_data$species) %>% mutate(species = row.names(.))
+  df <- cbind.data.frame(data[,1:2], methods)
+  gg <- merge(df, aggregate(cbind(mean.x=MDS1,mean.y=MDS2)~assessment.method, df, mean), by="assessment.method") %>%
+    mutate(assessment.method = factor(assessment.method, levels = c("PAM.all", "OBM","PAM.survey", "camera")))
+  ggplot(gg, aes(MDS1,MDS2,color=assessment.method)) +
+    geom_point(size=3) +
+    geom_point(aes(x=mean.x,y=mean.y),size=5) +
+    scale_colour_manual(values = c("#189F9F","#FF8C00", "#18709F","#A034F0"),
+                        name = "",
+                        labels = c("PAM (all audio)", "OBM", "PAM (survey period)","Camera Trap")) +
+    geom_segment(aes(x=mean.x, y=mean.y, xend=MDS1, yend=MDS2), alpha = 0.2, linewidth = 1.5) +
+    my.theme() + theme(legend.position = "bottom")
+}
+
+(nmds.all.vocal.plot.jacc.centroid <- create_plot(all_vocal_jacc, all_nmds_jacc_vocal))
+
+```
+
+### Investigation
+
+#### Adonis
+
+##### Jaccard dissimilarity
+```{r}
+#| fig-width: 14
+#| fig-asp: 0.6
+#| warning: false
+
+all.dist_vocal <- vegdist(all_vocal_jacc[3:ncol(all_vocal_jacc)], 'jaccard')
+(all.adonis_vocal <- adonis2(all.dist_vocal ~ assessment.method, data=all_vocal_jacc))
+#Permutation test: significant difference between assessment methods for mammal communities.
+
+#Let's which method is different from which
+(adonis.methods.jacc_vocal <- adonis.pair(all.dist_vocal, all_vocal_jacc$assessment.method, corr.method = "holm"))
+#comparing all methods with each other
+
+```
+
+### Combined Figure
+
+```{r Combined figure, fig.height = 16/1.66, fig.width = 16, warning=FALSE}
+(nmds.jacc.combined <- (nmds.all.plot.jacc.centroid + ggtitle('All mammals') & theme(legend.position = "none", plot.title = element_text(size = 24))) +
+   (nmds.all.vocal.plot.jacc.centroid + ggtitle('Vocal mammals') & theme(legend.position = "none", plot.title = element_text(size = 24))) +
+   theme(legend.position = c(-0.25,-0.2), legend.text = element_text(size = 22),
+         plot.margin = unit(c(5, 10, 30, 10), units = "mm")) +
+   guides(colour = guide_legend(nrow = 1)))
+
+```
+
+
+# Survey Effort (Species accumulation curves)
+
+## All Mammals
+
+Considering the entire mammal community with vocal and non-vocal species.
+
+### Prepare data
+
+Merged duplicate rows for duplicate observations and transformed the dataset to a wide format.
+
+```{r}
+mammal_community <- mammal_data %>% 
+  select(site, SamplingDay, assessment.method,common.name) %>% #selected relevant grouping variables
+  group_by(across(everything())) %>% #groups by all available columns
+  mutate(number = n()) %>% #created a numbers column that counts the number of duplicate observations
+  ungroup() %>% 
+  unique() %>% #merged the duplicate rows
+  pivot_wider(names_from = "common.name", #transformed dataset from long to wide format
+              values_from = "number",
+              values_fill = list(number=0)) %>% #replaced NAs with 0
+  arrange(site) %>% 
+  filter(assessment.method != "PAM.all") %>% 
+  mutate(SamplingDay = as.factor(SamplingDay))
+```
+
+Added a category for the total richness.
+
+```{r}
+
+result.i <- vector("list",length(unique(mammal_community$site))) #created an empty list that was filled as the loop ran
+
+for(i in 1:length(unique(mammal_community$site))){ #looped over each study site
+  site.i <- mammal_community[mammal_community$site == unique(mammal_community$site)[i],] #subset to the site
+  
+  result.a <- vector("list",length(unique(site.i$SamplingDay))) #created an empty list to be filled by each SamplingDay
+  for(a in 1:length(unique(site.i$SamplingDay))){ #looped over each SamplingDay
+    
+    
+    SamplingDay.a <- site.i[site.i$SamplingDay == unique(site.i$SamplingDay)[a],] #subset to the SamplingDay
+    
+    meta.a <- cbind.data.frame(SamplingDay.a$site[1],SamplingDay.a$SamplingDay[1],c("total"))
+    
+    SamplingDay.a <- SamplingDay.a %>% select(where(is.numeric)) #removed first 3 columns of metadata and only keeps those with numeric data i.e. species columns
+    
+    total.a <- cbind.data.frame(meta.a,rbind.data.frame(colSums(SamplingDay.a))) #calculated column sums
+    
+    colnames(total.a) <- colnames(mammal_community)
+    
+    result.a[[a]] <- total.a} #added method results to list
+  
+  result.i[[i]] <- do.call("rbind.data.frame",result.a) #compressed list into data frame and add to the result.i list
+} #end loop
+
+result.i <- do.call("rbind.data.frame",result.i)
+
+mammal_community2 <- rbind.data.frame(mammal_community, result.i)
+
+```
+
+Added a remote sensing category to assessment methods. Remote sensing was a combination of PAM and camera trapping.
+
+```{r}
+
+result.j <- vector("list",length(unique(mammal_community$site))) #created an empty list that was filled as the loop ran
+
+for(i in 1:length(unique(mammal_community$site))){ #looped over each study site
+  site.i <- mammal_community[mammal_community$site == unique(mammal_community$site)[i],] #subset to the site
+  
+  result.a <- vector("list",length(unique(site.i$SamplingDay))) #created an empty list to be filled by each SamplingDay
+  for(a in 1:length(unique(site.i$SamplingDay))){ #looped over each SamplingDay
+    
+    
+    SamplingDay.a <- site.i[site.i$SamplingDay == unique(site.i$SamplingDay)[a],] %>% 
+      filter(assessment.method %in% c("camera", "PAM.survey"))
+    
+    meta.a <- cbind.data.frame(SamplingDay.a$site[1],SamplingDay.a$SamplingDay[1],c("remote"))
+    
+    SamplingDay.a <- SamplingDay.a %>% select(where(is.numeric)) #removed first 3 columns of metadata and only keeps those with numeric data i.e. species columns
+    
+    total.a <- cbind.data.frame(meta.a,rbind.data.frame(colSums(SamplingDay.a))) #calculated column sums
+    
+    colnames(total.a) <- colnames(mammal_community)
+    
+    result.a[[a]] <- total.a} #added method results to list
+  
+  result.j[[i]] <- do.call("rbind.data.frame",result.a) #compressed list into data frame and add to the result.i list
+} #end loop
+
+result.j <- do.call("rbind.data.frame",result.j)
+
+mammal_community2 <- rbind.data.frame(mammal_community2, result.j) %>% 
+  drop_na()
+
+```
+
+### Loop
+
+Created a loop that applied specaccum() to all methods across all sites. The output were values for richness of each method at each site over the course of the survey.
+
+```{r}
+# Created a data frame of zeros with 30 rows and the same number of columns as the total number of species.
+extra.rows <- data.frame(matrix(NA, nrow = 30, ncol = (ncol(mammal_community2)))) %>% 
+  replace(is.na(.), 0) %>% 
+  set_names(names(mammal_community2)) %>% 
+  select(-(1:3))
+
+result.i <- vector("list",length(unique(mammal_community2$site))) #created an empty list that was filled as the loop ran
+
+set.seed(8) #set seed for reproducibility
+for(i in 1:length(unique(mammal_community2$site))){ #looped over each study site
+  site.i <- mammal_community2[mammal_community2$site == unique(mammal_community2$site)[i],] #subset to the site
+  
+  dates.i <- ifelse(unique(site.i$site) %in% c("Tarcutta", "Undara", "Wambiana", "Rinyirru"), 28, 21) #manual addition of dates depending on site to avoid any issues from 0 animals being detected by any method on a given day 
+  
+  result.a <- vector("list",length(unique(site.i$assessment.method))) #created an empty list to be filled by each method
+  for(a in 1:length(unique(site.i$assessment.method))){ #looped over each method
+    
+    
+    method.a <- site.i[site.i$assessment.method == unique(site.i$assessment.method)[a],] #subset to the method
+    
+    if(nrow(method.a) > 1){ #only proceeded if detections occurred on more than 1 day for specaccum() to work properly
+      sampling.a <- method.a$assessment.method[1] #saved the name of the method
+      
+      method.a <- method.a %>% select(where(is.numeric)) #removed first 3 columns of metadata and only keeps those with numeric data i.e. species columns
+      
+      if(nrow(method.a)!=dates.i){ #if there were missing days (i.e., days when nothing was found, use the extra.rows object to add rows of zeros)
+        method.a <- rbind.data.frame(method.a,extra.rows[1:(dates.i-nrow(method.a)),])}
+      
+      accum.a <- specaccum(method.a,"random") #calculated data
+      
+      #created data frame of metadata, richness, and standard deviation
+      accum.a <- cbind.data.frame(rep(site.i$site[1],nrow(method.a)),rep(sampling.a,nrow(method.a)),accum.a$richness,accum.a$sd, 1:nrow(method.a))
+      colnames(accum.a) <- c("site","assessment.method","richness","sd", "day")
+      
+      accum.a$lower.ci <- accum.a$richness-qnorm(0.975)*accum.a$sd/sqrt(100) #calculated lower 95% CI
+      accum.a$upper.ci <- accum.a$richness+qnorm(0.975)*accum.a$sd/sqrt(100) #calculated upper 95% CI
+      
+      result.a[[a]] <- accum.a}} #added method results to list
+  
+  result.i[[i]] <- do.call("rbind.data.frame",result.a) #compressed list into data frame and add to the result.i list
+} #end loop
+```
+
+Transformed resulting list to a data frame.
+
+```{r}
+mammals_wide.result <- do.call("rbind.data.frame",result.i) %>% #compressed result.i list into data frame
+mutate(assessment.method = factor(assessment.method, levels = c("OBM",
+                                                                "camera",
+                                                                "PAM.survey",
+                                                                "remote",
+                                                                "total")),
+         site = factor(site, levels = c("Rinyirru", "Undara", "Wambiana", "Mourachan",
+                                        "Duval", "Tarcutta")))
+```
+
+### Visualisation
+
+Plot of rarefaction curves for each method split by sites.
+
+
+```{r}
+#| fig-width: 20
+#| fig-asp: 0.6
+#| warning: false
+
+(specaccum_mammals <- ggplot(mammals_wide.result, aes(x = day, y = richness, col = assessment.method)) + 
+  geom_ribbon(aes(ymin = lower.ci, ymax = upper.ci,fill=after_scale(alpha(colour, 0.3))),
+              linetype = 0.1) +
+  geom_vline(xintercept=c(7,14,21, 28), linetype="dotted", colour = "black") +
+  geom_line(aes(group = assessment.method),linewidth = 1.3) +
+  my.theme() +
+  facet_wrap(~site) +
+  theme(panel.border = element_rect(fill = NA, color = "black", linewidth = 1.5),
+        strip.background = element_rect(fill = "lightgrey"),
+        axis.title = element_text(size = 26),
+        axis.text = element_text(size = 26),
+        legend.text = element_text(size = 26),
+        legend.position = "bottom",
+        strip.text.x = element_text(size = 26)) +
+  scale_y_continuous(limits = c(0,25), breaks = seq(0, 25, by = 5),
+                     name = "Species Richness") +
+  scale_x_continuous(limits = c(0,28), breaks = seq(0, 30, by = 7),
+                     name = "Survey Effort (Days)") +
+  scale_colour_manual(values = c("#FF8C00", "#A034F0", "#189F9F","#D14103","black"),
+                      name = "",
+                      labels = c("OBM","Camera Trap", "PAM (survey period)", "Remote Sensing",
+                                 "Total Richness")))
+```
+
+## Vocal Mammals
+
+Considering vocal mammals only and excluding non-vocal mammals from the analysis.
+
+### Prepare data
+
+Merged duplicate rows for duplicate observations and transformed the dataset to a wide format.
+
+```{r}
+mammal_community_vocal <- mammal_data_vocal %>% 
+  select(site, SamplingDay, assessment.method,common.name) %>% #selected relevant grouping variables
+  group_by(across(everything())) %>% #groups by all available columns
+  mutate(number = n()) %>% #created a numbers column that counts the number of duplicate observations
+  ungroup() %>% 
+  unique() %>% #merged the duplicate rows
+  pivot_wider(names_from = "common.name", #transformed dataset from long to wide format
+              values_from = "number",
+              values_fill = list(number=0)) %>% #replaced NAs with 0
+  arrange(site) %>% 
+  filter(assessment.method != "PAM.all") %>% 
+  mutate(SamplingDay = as.factor(SamplingDay))
+```
+
+Added a total category to assessment methods.
+
+```{r}
+
+result.i <- vector("list",length(unique(mammal_community_vocal$site))) #created an empty list that was filled as the loop ran
+
+for(i in 1:length(unique(mammal_community_vocal$site))){ #looped over each study site
+  site.i <- mammal_community_vocal[mammal_community_vocal$site == unique(mammal_community_vocal$site)[i],] #subset to the site
+  
+  result.a <- vector("list",length(unique(site.i$SamplingDay))) #created an empty list to be filled by each SamplingDay
+  for(a in 1:length(unique(site.i$SamplingDay))){ #looped over each SamplingDay
+    
+    
+    SamplingDay.a <- site.i[site.i$SamplingDay == unique(site.i$SamplingDay)[a],] #subset to the SamplingDay
+    
+    meta.a <- cbind.data.frame(SamplingDay.a$site[1],SamplingDay.a$SamplingDay[1],c("total"))
+    
+    SamplingDay.a <- SamplingDay.a %>% select(where(is.numeric)) #removed first 3 columns of metadata and only keeps those with numeric data i.e. species columns
+    
+    total.a <- cbind.data.frame(meta.a,rbind.data.frame(colSums(SamplingDay.a))) #calculated column sums
+    
+    colnames(total.a) <- colnames(mammal_community_vocal)
+    
+    result.a[[a]] <- total.a} #added method results to list
+  
+  result.i[[i]] <- do.call("rbind.data.frame",result.a) #compressed list into data frame and add to the result.i list
+} #end loop
+
+result.i <- do.call("rbind.data.frame",result.i)
+
+mammal_community_vocal2 <- rbind.data.frame(mammal_community_vocal, result.i)
+
+```
+
+Added a remote sensing category to assessment methods. Remote sensing was a combination of PAM and camera trapping.
+
+```{r}
+
+result.j <- vector("list",length(unique(mammal_community_vocal$site))) #created an empty list that was filled as the loop ran
+
+for(i in 1:length(unique(mammal_community_vocal$site))){ #looped over each study site
+  site.i <- mammal_community_vocal[mammal_community_vocal$site == unique(mammal_community_vocal$site)[i],] #subset to the site
+  
+  result.a <- vector("list",length(unique(site.i$SamplingDay))) #created an empty list to be filled by each SamplingDay
+  for(a in 1:length(unique(site.i$SamplingDay))){ #looped over each SamplingDay
+    
+    
+    SamplingDay.a <- site.i[site.i$SamplingDay == unique(site.i$SamplingDay)[a],] %>% 
+      filter(assessment.method %in% c("camera", "PAM.survey"))
+    
+    meta.a <- cbind.data.frame(SamplingDay.a$site[1],SamplingDay.a$SamplingDay[1],c("remote"))
+    
+    SamplingDay.a <- SamplingDay.a %>% select(where(is.numeric)) #removed first 3 columns of metadata and only keeps those with numeric data i.e. species columns
+    
+    total.a <- cbind.data.frame(meta.a,rbind.data.frame(colSums(SamplingDay.a))) #calculated column sums
+    
+    colnames(total.a) <- colnames(mammal_community_vocal)
+    
+    result.a[[a]] <- total.a} #added method results to list
+  
+  result.j[[i]] <- do.call("rbind.data.frame",result.a) #compressed list into data frame and add to the result.i list
+} #end loop
+
+result.j <- do.call("rbind.data.frame",result.j)
+
+mammal_community_vocal2 <- rbind.data.frame(mammal_community_vocal2, result.j) %>% 
+  drop_na()
+
+```
+
+### Loop
+
+Created a loop that applied specaccum() to all methods across all sites. The output were values for richness of each method at each site over the course of the survey.
+
+```{r}
+# Created a data frame of zeros with 30 rows and the same number of columns as the total number of species.
+extra.rows <- data.frame(matrix(NA, nrow = 30, ncol = (ncol(mammal_community_vocal2)))) %>% 
+  replace(is.na(.), 0) %>% 
+  set_names(names(mammal_community_vocal2)) %>% 
+  select(-(1:3))
+
+result.i <- vector("list",length(unique(mammal_community_vocal2$site))) #created an empty list that was filled as the loop ran
+
+set.seed(8) #set seed for reproducibility
+for(i in 1:length(unique(mammal_community_vocal2$site))){ #looped over each study site
+  site.i <- mammal_community_vocal2[mammal_community_vocal2$site == unique(mammal_community_vocal2$site)[i],] #subset to the site
+  
+  dates.i <- ifelse(unique(site.i$site) %in% c("Tarcutta", "Undara", "Wambiana", "Rinyirru"), 28, 21) #manual addition of dates depending on site to avoid any issues from 0 animals being detected by any method on a given day 
+  
+  result.a <- vector("list",length(unique(site.i$assessment.method))) #created an empty list to be filled by each method
+  for(a in 1:length(unique(site.i$assessment.method))){ #looped over each method
+    
+    
+    method.a <- site.i[site.i$assessment.method == unique(site.i$assessment.method)[a],] #subset to the method
+    
+    if(nrow(method.a) > 1){ #only proceeded if detections occurred on more than 1 day for specaccum() to work properly
+      sampling.a <- method.a$assessment.method[1] #saved the name of the method
+      
+      method.a <- method.a %>% select(where(is.numeric)) #removed first 3 columns of metadata and only keeps those with numeric data i.e. species columns
+      
+      if(nrow(method.a)!=dates.i){ #if there were missing days (i.e., days when nothing was found, use the extra.rows object to add rows of zeros)
+        method.a <- rbind.data.frame(method.a,extra.rows[1:(dates.i-nrow(method.a)),])}
+      
+      accum.a <- specaccum(method.a,"random") #calculated data
+      
+      #created data frame of metadata, richness, and standard deviation
+      accum.a <- cbind.data.frame(rep(site.i$site[1],nrow(method.a)),rep(sampling.a,nrow(method.a)),accum.a$richness,accum.a$sd, 1:nrow(method.a))
+      colnames(accum.a) <- c("site","assessment.method","richness","sd", "day")
+      
+      accum.a$lower.ci <- accum.a$richness-qnorm(0.975)*accum.a$sd/sqrt(100) #calculated lower 95% CI
+      accum.a$upper.ci <- accum.a$richness+qnorm(0.975)*accum.a$sd/sqrt(100) #calculated upper 95% CI
+      
+      result.a[[a]] <- accum.a}} #added method results to list
+  
+  result.i[[i]] <- do.call("rbind.data.frame",result.a) #compressed list into data frame and add to the result.i list
+} #end loop
+```
+
+Transformed resulting list to a data frame.
+
+```{r}
+mammals_wide.result_vocal <- do.call("rbind.data.frame",result.i) %>% #compressed result.i list into data frame
+mutate(assessment.method = factor(assessment.method, levels = c("OBM",
+                                                                "camera",
+                                                                "PAM.survey",
+                                                                "remote",
+                                                                "total")),
+         site = factor(site, levels = c("Rinyirru", "Undara", "Wambiana", "Mourachan",
+                                        "Duval", "Tarcutta")))
+```
+
+### Visualisation
+
+Plot of rarefaction curves for each method split by sites.
+
+```{r}
+#| fig-width: 20
+#| fig-asp: 0.6
+#| warning: false
+
+(specaccum_mammals_vocal <- ggplot(mammals_wide.result_vocal, aes(x = day, y = richness, col = assessment.method)) + 
+  geom_ribbon(aes(ymin = lower.ci, ymax = upper.ci,fill=after_scale(alpha(colour, 0.3))),
+              linetype = 0.1) +
+  geom_vline(xintercept=c(7,14,21, 28), linetype="dotted", colour = "black") +
+  geom_line(aes(group = assessment.method), linewidth = 1.3) +
+  my.theme() +
+  facet_wrap(~site) +
+  theme(panel.border = element_rect(fill = NA, color = "black", linewidth = 1.5),
+        strip.background = element_rect(fill = "lightgrey"),
+        axis.title = element_text(size = 26),
+        axis.text = element_text(size = 26),
+        legend.text = element_text(size = 26),
+        legend.position = "bottom",
+        strip.text.x = element_text(size = 26)) +
+  scale_y_continuous(limits = c(0,15), breaks = seq(0, 15, by = 5),
+                     name = "") +
+  scale_x_continuous(limits = c(0,28), breaks = seq(0, 30, by = 7),
+                     name = "Survey Effort (Days)") +
+  scale_colour_manual(values = c("#FF8C00", "#A034F0", "#189F9F","#D14103" ,"black"),
+                      name = "",
+                      labels = c("OBM","Camera Trap", "PAM (survey period)", "Remote Sensing",
+                                 "Total Richness")))
+```
+
+### Combined Figure
+
+```{r}
+#| fig-width: 30
+#| fig-height: 12
+
+(specaccum_mammals_combined <- (specaccum_mammals + ggtitle('All mammals') & theme(legend.position = "none", plot.title = element_text(size = 24))) +
+   (specaccum_mammals_vocal + ggtitle('Vocal mammals') & theme(legend.position = "none", plot.title = element_text(size = 24))) +
+   theme(legend.position = c(-0.1,-0.2), legend.text = element_text(size = 22),
+         plot.margin = unit(c(5, 10, 30, 10), units = "mm")) +
+   guides(colour = guide_legend(nrow = 1)))
+
+```
+
+## PAM survey length
+
+How many days until PAM.all reaches values similar to OBM for all mammals and only vocal mammals. In other words how long should we leave recorders out on average until we get the best number of species.
+
+```{r}
+all_mammals <- mammal_data %>% 
+  filter(assessment.method == "PAM.all") %>% 
+  select(site, SamplingDay, assessment.method,common.name) %>% #selected relevant grouping variables
+  group_by(across(everything())) %>% #groups by all available columns
+  mutate(number = n()) %>% #created a numbers column that counts the number of duplicate observations
+  ungroup() %>% 
+  unique() %>% #merged the duplicate rows
+  pivot_wider(names_from = "common.name", #transformed dataset from long to wide format
+              values_from = "number",
+              values_fill = list(number=0)) %>% #replaced NAs with 0
+  arrange(site) %>%
+  mutate(SamplingDay = as.factor(SamplingDay))
+```
+
+Created a loop that applied specaccum() to all methods across all sites. The output were values for richness of each method at each site over the course of the survey.
+
+```{r}
+# Created a data frame of zeros with 30 rows and the same number of columns as the total number of species.
+extra.rows <- data.frame(matrix(NA, nrow = 1235, ncol = (ncol(all_mammals)))) %>% 
+  replace(is.na(.), 0) %>% 
+  set_names(names(all_mammals)) %>% 
+  select(-(1:3))
+
+result.i <- vector("list",length(unique(all_mammals$site))) #created an empty list that was filled as the loop ran
+
+set.seed(8) #set seed for reproducibility
+for(i in 1:length(unique(all_mammals$site))){ #looped over each study site
+  site.i <- all_mammals[all_mammals$site == unique(all_mammals$site)[i],] #subset to the site
+  
+   #manual addition of dates depending on site to avoid any issues from 0 animals being detected by any method on a given day 
+  site_values <- c(Tarcutta = 986, Duval = 679, Mourachan = 783, Wambiana = 1235, Undara = 780, Rinyirru = 488)
+  
+  dates.i <- site_values[match(unique(site.i$site), names(site_values))]
+  
+  result.a <- vector("list",length(unique(site.i$assessment.method))) #created an empty list to be filled by each method
+  for(a in 1:length(unique(site.i$assessment.method))){ #looped over each method
+    
+    
+    method.a <- site.i[site.i$assessment.method == unique(site.i$assessment.method)[a],] #subset to the method
+    
+    if(nrow(method.a) > 1){ #only proceeded if detections occurred on more than 1 day for specaccum() to work properly
+      sampling.a <- method.a$assessment.method[1] #saved the name of the method
+      
+      method.a <- method.a %>% select(where(is.numeric)) #removed first 3 columns of metadata and only keeps those with numeric data i.e. species columns
+      
+      if(nrow(method.a)!=dates.i){ #if there were missing days (i.e., days when nothing was found, use the extra.rows object to add rows of zeros)
+        method.a <- rbind.data.frame(method.a,extra.rows[1:(dates.i-nrow(method.a)),])}
+      
+      accum.a <- specaccum(method.a,"random") #calculated data
+      
+      #created data frame of metadata, richness, and standard deviation
+      accum.a <- cbind.data.frame(rep(site.i$site[1],nrow(method.a)),rep(sampling.a,nrow(method.a)),accum.a$richness,accum.a$sd, 1:nrow(method.a))
+      colnames(accum.a) <- c("site","assessment.method","richness","sd", "day")
+      
+      accum.a$lower.ci <- accum.a$richness-qnorm(0.975)*accum.a$sd/sqrt(100) #calculated lower 95% CI
+      accum.a$upper.ci <- accum.a$richness+qnorm(0.975)*accum.a$sd/sqrt(100) #calculated upper 95% CI
+      
+      result.a[[a]] <- accum.a}} #added method results to list
+  
+  result.i[[i]] <- do.call("rbind.data.frame",result.a) #compressed list into data frame and add to the result.i list
+} #end loop
+```
+
+Transformed resulting list to a data frame.
+
+```{r}
+all_mammals.result <- do.call("rbind.data.frame",result.i) %>%  #compressed result.i list into data
+  mutate(site = factor(site, levels = c("Rinyirru", "Undara", "Wambiana", "Mourachan",
+                                        "Duval", "Tarcutta")))
+```
+
+```{r}
+pam.max <- all_mammals.result %>% 
+  group_by(site) %>% 
+  filter(assessment.method == "PAM.all",
+         day == max(day)) %>% 
+  ungroup() %>% 
+  select(site, richness.max = richness)
+
+pam.28 <- all_mammals.result %>% 
+  group_by(site) %>% 
+  filter(assessment.method == "PAM.all",
+         day == 28) %>% 
+  ungroup() %>% 
+  select(richness.28 = richness) %>% 
+  mutate(prop.28 = round(richness.28/pam.max$richness.max, digits = 2))
+
+pam.90 <- all_mammals.result %>% 
+  group_by(site) %>% 
+  filter(assessment.method == "PAM.all",
+         day == 90) %>% 
+  ungroup() %>% 
+  select(richness.90 = richness) %>% 
+  mutate(prop.90 = round(richness.90/pam.max$richness.max, digits = 2))
+
+pam.180 <- all_mammals.result %>% 
+  group_by(site) %>% 
+  filter(assessment.method == "PAM.all",
+         day == 180) %>% 
+  ungroup() %>% 
+  select(richness.180 = richness) %>% 
+  mutate(prop.180 = round(richness.180/pam.max$richness.max, digits = 2))
+
+pam.365 <- all_mammals.result %>% 
+  group_by(site) %>% 
+  filter(assessment.method == "PAM.all",
+         day == 365) %>% 
+  ungroup() %>% 
+  select(richness.365 = richness) %>% 
+  mutate(prop.365 = round(richness.365/pam.max$richness.max, digits = 2))
+
+pam.rich.prop <- cbind(pam.max,pam.28,pam.90,pam.180,pam.365) %>% 
+  mutate(site = factor(site, levels = c("Rinyirru", "Undara", "Wambiana", "Mourachan",
+                                        "Duval", "Tarcutta")))
+
+(sampling.table <- pam.rich.prop %>% 
+  select(Site = site, "PAM (total richness)" = richness.max,
+         "PAM (proportion 28 days)" = prop.28,
+         "PAM (proportion 90 days)" = prop.90,
+         "PAM (proportion 180 days)" = prop.180,
+         "PAM (proportion 365 days)" = prop.365) %>% 
+  add_row(Site = "Average", "PAM (total richness)" = round(mean(pam.rich.prop$richness.max)),
+          "PAM (proportion 28 days)" = round(mean(pam.rich.prop$prop.28), digits = 2),
+          "PAM (proportion 90 days)" = round(mean(pam.rich.prop$prop.90), digits = 2),
+          "PAM (proportion 180 days)" = round(mean(pam.rich.prop$prop.180), digits = 2),
+          "PAM (proportion 365 days)" = round(mean(pam.rich.prop$prop.365), digits = 2)))
+```
+
+### Visualisation
+
+```{r}
+#| fig-width: 25
+#| fig-asp: 0.6
+vline_data <- data.frame(site = c("Rinyirru", "Undara", "Wambiana", "Mourachan", "Duval", "Tarcutta"),
+                         xintercept = c(12, 175, 17, 88, 676,320)) %>% 
+  mutate(site = factor(site, levels = c("Rinyirru", "Undara", "Wambiana", "Mourachan",
+                                        "Duval", "Tarcutta")))
+
+vline_data2 <- data.frame(site = c("Rinyirru", "Undara", "Wambiana", "Mourachan", "Duval", "Tarcutta"),
+                         xintercept = c(12, 35, 12, 17, 12,9)) %>% 
+  mutate(site = factor(site, levels = c("Rinyirru", "Undara", "Wambiana", "Mourachan",
+                                        "Duval", "Tarcutta")))
+
+hline_data_vocal <- data.frame(site = c("Rinyirru", "Undara", "Wambiana", "Mourachan", "Tarcutta", "Duval"),
+                               yintercept = c(4.1, 6, 7, 6,12,10)) %>% 
+  mutate(site = factor(site, levels = c("Rinyirru", "Undara", "Wambiana", "Mourachan",
+                                        "Duval", "Tarcutta")))
+
+hline_data_vocal2 <- data.frame(site = c("Rinyirru", "Undara", "Wambiana", "Mourachan", "Tarcutta", "Duval"),
+                               yintercept = c(3.9, 4, 6, 4,6,6)) %>% 
+  mutate(site = factor(site, levels = c("Rinyirru", "Undara", "Wambiana", "Mourachan",
+                                        "Duval", "Tarcutta")))
+
+
+
+hline_data_cam <- data.frame(site = c("Rinyirru", "Undara", "Wambiana", "Mourachan", "Tarcutta", "Duval"),
+                               yintercept = c(4, 4, 6, 4,6,6)) %>% 
+  mutate(site = factor(site, levels = c("Rinyirru", "Undara", "Wambiana", "Mourachan",
+                                        "Duval", "Tarcutta")))
+
+vline_data_cam <- data.frame(site = c("Rinyirru", "Undara", "Wambiana", "Mourachan", "Duval", "Tarcutta"),
+                         xintercept = c(12, 35, 12, 17, 12,9)) %>% 
+  mutate(site = factor(site, levels = c("Rinyirru", "Undara", "Wambiana", "Mourachan",
+                                        "Duval", "Tarcutta")))
+
+hline_data_28 <- data.frame(site = c("Rinyirru", "Undara", "Wambiana", "Mourachan", "Tarcutta", "Duval"),
+                               yintercept = c(5.48, 3.51, 7.88, 4.32,8.52,6.87)) %>% 
+  mutate(site = factor(site, levels = c("Rinyirru", "Undara", "Wambiana", "Mourachan",
+                                        "Duval", "Tarcutta")))
+
+vline_data_28 <- data.frame(site = c("Rinyirru", "Undara", "Wambiana", "Mourachan", "Duval", "Tarcutta"),
+                         xintercept = c(28, 28, 28, 21, 21,28)) %>% 
+  mutate(site = factor(site, levels = c("Rinyirru", "Undara", "Wambiana", "Mourachan",
+                                        "Duval", "Tarcutta")))
+
+hline_data_total <- data.frame(site = c("Rinyirru", "Undara", "Wambiana", "Mourachan", "Tarcutta", "Duval"),
+                               yintercept = c(8, 7, 11, 8,13,11)) %>% 
+  mutate(site = factor(site, levels = c("Rinyirru", "Undara", "Wambiana", "Mourachan",
+                                        "Duval", "Tarcutta")))
+
+vline_data_total <- data.frame(site = c("Rinyirru", "Undara","Tarcutta"),
+                         xintercept = c(210, 771, 968)) %>% 
+  mutate(site = factor(site, levels = c("Rinyirru", "Undara","Tarcutta")))
+
+
+(spec_all_mammals_plot <- ggplot(all_mammals.result, aes(x = day, y = richness, col = assessment.method)) +
+    geom_ribbon(aes(ymin = lower.ci, ymax = upper.ci,fill=after_scale(alpha(colour, 0.5))),
+              linetype = 0.1) +
+    geom_line(aes(group = assessment.method), linewidth = 1.5) +
+    my.theme() +
+    facet_wrap(~site, scales = "free_x") +
+    geom_hline(data = hline_data_vocal, aes(yintercept = yintercept), linetype="dashed", color = "#FF8C00",
+               linewidth = 1) +
+    geom_hline(data = hline_data_vocal2, aes(yintercept = yintercept), linetype="dashed", color = "#A034F0",
+               linewidth = 1) +
+    #geom_vline(data = vline_data, aes(xintercept = xintercept), linetype="dotted", color = "#FF8C00") +
+    #geom_vline(data = vline_data2, aes(xintercept = xintercept), linetype="dotted", color = "#A034F0") +
+    geom_text(data = vline_data, aes(x = 100, y = 14, label = paste0("DTM: ",xintercept)),
+                                     vjust = -1, size = 8,inherit.aes = FALSE, color = "#FF8C00") +
+    geom_text(data = vline_data2, aes(x = 100, y = 13, label = paste0("DTM: ",xintercept)),
+                                     vjust = -1, size = 8,inherit.aes = FALSE, color = "#A034F0") +
+    theme(panel.border = element_rect(fill = NA, color = "black", linewidth = 1.5),
+        strip.background = element_rect(fill = "lightgrey"),
+        axis.title = element_text(size = 26),
+        axis.text = element_text(size = 26),
+        legend.text = element_text(size = 26),
+        legend.position = "bottom",
+        strip.text.x = element_text(size = 26)) + 
+    scale_y_continuous(limits = c(0,15), breaks = seq(0, 15, by = 5),
+                     name = "Species Richness") +
+    scale_x_continuous(name = "Survey Effort (Days)") +
+    scale_colour_manual(values = c("#189F9F"),
+                      name = "",
+                      labels = c("PAM (all audio)")))
+```
+
+# Session Info
+```{r}
+sessionInfo()
+```
+
+# Cite Packages
+```{r}
+cite_packages()
+```
