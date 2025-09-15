@@ -1,4 +1,4 @@
-## Data, code and supplementary information for: Hoefer S, Allen-Ankins S, McKnight DT, Nordberg EJ, Schwarzkopf L (2024) Sensors vs Surveyors: Comparing passive acoustic monitoring, camera trapping and observer-based monitoring for terrestrial mammals.
+## Data, code and supplementary information for: Hoefer S, Allen-Ankins S, McKnight DT, Nordberg EJ, Schwarzkopf L (2025) Sensors vs Surveyors: Comparing passive acoustic monitoring, camera trapping and observer-based monitoring for terrestrial mammals.
 
 ### Contains:
 
